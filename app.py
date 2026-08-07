@@ -1,188 +1,101 @@
 import streamlit as st
+import os
 import io
-import asyncio
-import html
+import time
 from google import genai
-from google.genai import types
 import docx
 from ebooklib import epub
 
-# -----------------------------------------------------------------------------
-# PAGE CONFIG
-# -----------------------------------------------------------------------------
+# ------------------ CONFIG ------------------
 st.set_page_config(page_title="Fast Translator", page_icon="⚡")
+
 st.title("⚡ Fast TXT/DOCX → English → EPUB")
 
-# -----------------------------------------------------------------------------
-# SESSION STATE
-# -----------------------------------------------------------------------------
-if "translated_text" not in st.session_state:
-    st.session_state.translated_text = None
-if "file_hash" not in st.session_state:
-    st.session_state.file_hash = None
+# ------------------ API KEY ------------------
+API_KEY = "YOUR_API_KEY_HERE"  # 🔥 PUT YOUR GEMINI API KEY HERE
 
-# -----------------------------------------------------------------------------
-# TEXT EXTRACTION
-# -----------------------------------------------------------------------------
-def extract_text_from_docx(file_bytes):
-    doc = docx.Document(io.BytesIO(file_bytes))
+client = genai.Client(api_key=API_KEY)
+
+# ------------------ FUNCTIONS ------------------
+
+def read_txt(file):
+    return file.read().decode("utf-8", errors="ignore")
+
+def read_docx(file):
+    doc = docx.Document(file)
     return "\n".join([p.text for p in doc.paragraphs])
 
-# -----------------------------------------------------------------------------
-# CHUNKING (SAFE SIZE)
-# -----------------------------------------------------------------------------
-def chunk_text(text, max_chars=30000):
-    paragraphs = text.split("\n")
-    chunks = []
-    current = []
-    length = 0
+def split_text(text, max_chars=4000):
+    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
 
-    for para in paragraphs:
-        if length + len(para) > max_chars:
-            chunks.append("\n".join(current))
-            current = [para]
-            length = len(para)
-        else:
-            current.append(para)
-            length += len(para)
+def translate_chunk(chunk):
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"Translate the following text to English. Keep names consistent:\n\n{chunk}"
+        )
+        return response.text
+    except Exception as e:
+        return f"\n[ERROR: {e}]\n"
 
-    if current:
-        chunks.append("\n".join(current))
-
-    return chunks
-
-# -----------------------------------------------------------------------------
-# EPUB CREATION (FIXED)
-# -----------------------------------------------------------------------------
-def create_epub(translated_text, title="Translated Book"):
-    title = str(title)
-
+def create_epub(title, content):
     book = epub.EpubBook()
-    book.set_identifier("id123456")
     book.set_title(title)
     book.set_language("en")
-    book.add_author("Auto Translator")
 
-    c1 = epub.EpubHtml(
-        title="Chapter 1",
-        file_name="chap_1.xhtml",
-        lang="en"
-    )
+    chapter = epub.EpubHtml(title="Chapter", file_name="chap_1.xhtml")
+    chapter.content = f"<h1>{title}</h1><p>{content.replace(chr(10), '<br>')}</p>"
 
-    content = "<html><body>"
+    book.add_item(chapter)
+    book.toc = (epub.Link("chap_1.xhtml", "Chapter", "chap1"),)
 
-    for para in translated_text.split("\n"):
-        if para.strip():
-            safe = html.escape(para.strip())
-            content += f"<p>{safe}</p>"
-
-    content += "</body></html>"
-
-    c1.content = content
-    book.add_item(c1)
-
-    book.toc = (epub.Link("chap_1.xhtml", "Content", "c1"),)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
 
-    book.spine = ["nav", c1]
+    style = 'BODY { font-family: Arial; }'
+    nav_css = epub.EpubItem(uid="style_nav", file_name="style/nav.css", media_type="text/css", content=style)
+
+    book.add_item(nav_css)
+    book.spine = ["nav", chapter]
 
     buffer = io.BytesIO()
     epub.write_epub(buffer, book)
-    buffer.seek(0)
-
     return buffer
 
-# -----------------------------------------------------------------------------
-# TRANSLATION
-# -----------------------------------------------------------------------------
-async def translate_chunk(client, chunk):
-    loop = asyncio.get_event_loop()
+# ------------------ UI ------------------
 
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=chunk,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "Translate to natural fluent English. "
-                    "Keep paragraphs. No comments."
-                )
-            )
-        )
-    )
+uploaded_file = st.file_uploader("Upload TXT or DOCX", type=["txt", "docx"])
 
-    return response.text
-
-async def translate_all(client, chunks):
-    tasks = [translate_chunk(client, c) for c in chunks]
-    results = await asyncio.gather(*tasks)
-    return "\n".join(results)
-
-# -----------------------------------------------------------------------------
-# UI
-# -----------------------------------------------------------------------------
-st.sidebar.header("🔑 API Key")
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
-
-file = st.file_uploader("Upload TXT or DOCX", type=["txt", "docx"])
-
-if file:
-    file_id = f"{file.name}_{file.size}"
-
-    if st.session_state.file_hash != file_id:
-        st.session_state.translated_text = None
-        st.session_state.file_hash = file_id
-
-    data = file.read()
-
-    if file.name.endswith(".txt"):
-        try:
-            raw_text = data.decode("utf-8")
-        except:
-            raw_text = data.decode("latin-1")
+if uploaded_file:
+    if uploaded_file.name.endswith(".txt"):
+        text = read_txt(uploaded_file)
     else:
-        raw_text = extract_text_from_docx(data)
+        text = read_docx(uploaded_file)
 
-    st.info(f"Words: {len(raw_text.split()):,}")
+    st.info(f"Words: {len(text.split()):,}")
 
     if st.button("⚡ Translate"):
-        if not api_key:
-            st.error("Enter API key")
-        else:
-            try:
-                client = genai.Client(api_key=api_key)
+        chunks = split_text(text)
+        st.write(f"Chunks: {len(chunks)}")
 
-                chunks = chunk_text(raw_text)
-                st.write(f"Chunks: {len(chunks)}")
+        translated_text = ""
 
-                with st.spinner("Translating..."):
-                    result = asyncio.run(translate_all(client, chunks))
+        progress = st.progress(0)
 
-                st.session_state.translated_text = result
-                st.success("Done!")
+        for i, chunk in enumerate(chunks):
+            result = translate_chunk(chunk)
+            translated_text += result + "\n"
 
-            except Exception as e:
-                st.error(str(e))
+            progress.progress((i + 1) / len(chunks))
+            time.sleep(1)  # prevents rate limit
 
-# -----------------------------------------------------------------------------
-# DOWNLOAD
-# -----------------------------------------------------------------------------
-if st.session_state.translated_text:
-    st.subheader("📥 Download")
+        st.success("✅ Translation Complete!")
 
-    base_name = file.name.rsplit(".", 1)[0]
-    epub_name = f"{base_name}_translated.epub"
+        epub_file = create_epub("Translated Book", translated_text)
 
-    epub_file = create_epub(
-        st.session_state.translated_text,
-        title=base_name
-    )
-
-    st.download_button(
-        "💾 Download EPUB",
-        data=epub_file,
-        file_name=epub_name,
-        mime="application/epub+zip"
-    )
+        st.download_button(
+            label="📥 Download EPUB",
+            data=epub_file,
+            file_name="translated.epub",
+            mime="application/epub+zip"
+        )
